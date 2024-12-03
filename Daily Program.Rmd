@@ -1,0 +1,460 @@
+---
+author: "Ben Scartz"
+date: "2024-04-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(baseballr)
+library(glue)
+library(xgboost)
+```
+
+
+
+```{r}
+load('Statcast2024.rda')
+load('functions.rda')
+```
+
+Gameday data function
+
+```{r}
+get_gameday_data <- function(data, date = sys.Date()){
+
+################################### Set Necessary Vectors ####################
+
+swings_vector <- c('hit_into_play', 'swinging_strike_blocked', 'swinging_strike', 'foul_tip', 'foul')
+hits_vector <- c('single', 'double', 'triple', 'home_run')
+at_bats_vector <- c('field_out', 'strikeout', 'grounded_into_double_play', 'fielders_choice', 'fielders_choice_out', 'triple_play', 'strikeout_double_play', 'double_play', 'field_error', 'force_out', hits_vector)
+plate_appearances_vector <- c(at_bats_vector, 'sac_fly', 'walk', 'hit_by_pitch', 'sac_bunt', 'sac_bunt_double_play', 'sac_fly_double_play', 'catcher_interf')
+swings_vector <- c('hit_into_play', 'swinging_strike_blocked', 'swinging_strike', 'foul_tip', 'foul')
+
+################################ Update Statcast ##############################
+
+data <- Statcast2024
+
+date1 <- as.Date(date)
+
+max_date <- max(data$game_date)
+
+if(max_date < (date1 - 1)){
+
+new_statcast <- data.frame()
+
+start <- as.Date(max_date + 1)
+end <- date1 - 1
+d <- start
+
+#Add each date to table
+while (d <= end) {
+  
+  
+  day <- statcast_search(start_date = d, 
+                         end_date = d)
+  
+  # Check if there were any games played on the day
+  if (nrow(day) > 0) {
+    new_statcast <- rbind(new_statcast, day)
+    
+  }
+  
+  
+  # print(glue(date_added, ' added!'))
+  
+  d <- d + 1
+}
+
+# Add 'barrel' column 
+new_statcast$barrel <- code_barrel(new_statcast[, c('launch_angle', 'launch_speed')])$barrel
+
+# Add 'true_zone' column
+
+new_statcast$true_zone <- ifelse(new_statcast$plate_z < new_statcast$sz_top & 
+                                 new_statcast$plate_z > new_statcast$sz_bot &
+                                 new_statcast$plate_x < (0.83) &
+                                 new_statcast$plate_x > (-0.83),
+                                 'strike','ball')
+
+data <- rbind(data, new_statcast)
+
+} else if(max_date > (date1 - 1)){
+  
+  data <- data %>% filter(game_date <= (date1 - 1))
+  
+}
+print(glue('Data is up to date as of {date}.'))
+
+
+save(data, file = 'Statcast2024.rda')
+
+################################## Stats to date ##############################
+
+
+####### Game data 
+
+
+data <- data %>%
+  mutate(batter_team = case_when(inning_topbot == 'Top' ~ away_team,
+                                 inning_topbot == 'Bot' ~ home_team),
+         pitcher_team = case_when(inning_topbot == 'Top' ~ home_team,
+                                 inning_topbot == 'Bot' ~ away_team))
+
+
+game_data <- data %>%
+  group_by(game_pk, batter) %>%
+  summarize(
+            hits = sum(events %in% hits_vector),
+            batter_team = first(batter_team),
+            pitcher_team = first(pitcher_team),
+            home_team = first(home_team),
+            away_team = first(away_team))
+
+home_starter <- data %>%
+  filter(inning_topbot == 'Top') %>%
+  group_by(game_pk) %>%
+  summarize(home_starter = first(pitcher))
+
+away_starter <- data %>%
+  filter(inning_topbot == 'Bot') %>%
+  group_by(game_pk) %>%
+  summarize(away_starter = first(pitcher))
+
+starters <- home_starter %>%
+  left_join(away_starter, by = 'game_pk')
+
+game_data <- game_data %>%
+  left_join(starters, by = 'game_pk') %>%
+  mutate(opp_starter = case_when(
+                                  batter_team == away_team ~ home_starter,
+                                  batter_team == home_team ~ away_starter
+  )) %>%
+  select(-home_team, -away_team)
+
+print('Game data complete.')
+
+
+################################## Batter Stats ##############################
+
+################ 90+
+
+## By pitch & side
+by_pitch_90 <- data %>%
+  group_by(batter, p_throws, pitch_name) %>%
+  summarize(pitch_90 = sum(launch_speed >= 90, na.rm = TRUE) /
+                            sum(description %in% swings_vector, na.rm = TRUE),
+            swings = sum(description %in% swings_vector, na.rm = TRUE)) %>%
+  mutate(pitch_90 = if_else(swings < 10, NA, pitch_90))
+
+batter_90 <- by_pitch_90 %>%
+  mutate(combined_name = paste(pitch_name, p_throws, "90", sep = "_")) %>%
+  ungroup() %>%
+  select(-p_throws, -swings, -pitch_name) %>%
+  pivot_wider(names_from = combined_name, values_from = pitch_90)
+
+############ xBA
+
+batter_xba <- data %>%
+  group_by(batter) %>%
+  summarize(xba = sum(estimated_ba_using_speedangle, na.rm = TRUE) /
+              sum(events %in% at_bats_vector, na.rm = TRUE),
+            at_bats = sum(events %in% at_bats_vector, na.rm = TRUE)) %>%
+  mutate(xba = if_else(at_bats < 25, NA, xba)) %>%
+  select(-at_bats)
+
+# By side
+xba_by_side <- data %>%
+  group_by(batter, p_throws) %>%
+  summarize(xba = sum(estimated_ba_using_speedangle, na.rm = TRUE) /
+              sum(events %in% at_bats_vector, na.rm = TRUE),
+            at_bats = sum(events %in% at_bats_vector, na.rm = TRUE)) %>%
+  mutate(xba = if_else(at_bats < 25, NA, xba)) %>%
+  mutate(combined_name = paste("xba", p_throws, sep = "_")) %>%
+  select(-p_throws, -at_bats) %>%
+  pivot_wider(names_from = combined_name, values_from = xba)
+
+# Combine
+batter_xba <- batter_xba %>%
+  left_join(xba_by_side, by = "batter")
+
+########## xBA 25
+
+batter_xba_25 <- data %>%
+  group_by(batter) %>%
+  arrange(desc(game_pk), at_bat_number) %>%
+  mutate(pa_number = cumsum(events %in% plate_appearances_vector)) %>%
+  summarize(xba_25 = sum(estimated_ba_using_speedangle *
+                           (pa_number >= (max(pa_number) - 25)),
+                         na.rm = TRUE) /
+              sum(events %in% at_bats_vector *
+                           (pa_number >= (max(pa_number) - 25)),
+                          na.rm = TRUE))
+
+########### PA per game
+
+batter_pa_per_game <- data %>%
+  group_by(batter) %>%
+  summarize(pa_per_game = sum(events %in% plate_appearances_vector, na.rm = T) /
+              length(unique(game_pk)))
+
+########### ZO Swing
+
+batter_zoswing <- data %>%
+  group_by(batter, p_throws, pitch_name) %>%
+  summarize(pitches = n(),
+            z_swing = sum(description %in% swings_vector & true_zone == 'strike', na.rm = T) /
+                      sum(true_zone == 'strike', na.rm = T),
+            o_swing = sum(description %in% swings_vector & true_zone == 'ball', na.rm = T) /
+                      sum(true_zone == 'ball', na.rm = T),
+            zo_swing = z_swing - o_swing) %>%
+  mutate(zo_swing = if_else(pitches < 25, NA, zo_swing)) %>%
+  select(-z_swing, -o_swing)%>%
+  mutate(combined_name = paste(pitch_name, p_throws, "ZO", sep = "_")) %>%
+  ungroup() %>%
+  select(-p_throws, -pitches, -pitch_name) %>%
+  pivot_wider(names_from = combined_name, values_from = zo_swing)
+
+############### Join
+
+batter_stats <- batter_90 %>%
+  left_join(batter_xba, by = "batter") %>%
+  left_join(batter_xba_25, by = "batter") %>%
+  left_join(batter_pa_per_game, by = "batter") %>%
+  left_join(batter_zoswing, by = "batter") %>%
+  select(batter, everything())
+
+
+print('Batter stats complete.')
+  
+  
+################################## Pitcher Stats #############################
+
+############# 90 + 
+
+pitcher_90 <- data %>%
+  group_by(pitcher, p_throws, pitch_name) %>%
+  summarize(pitch_90 = sum(launch_speed >= 90, na.rm = TRUE) /
+                            sum(description %in% swings_vector, na.rm = TRUE),
+            swings = sum(description %in% swings_vector, na.rm = TRUE)) %>%
+  mutate(pitch_90 = if_else(swings < 10, NA, pitch_90)) %>%
+  mutate(combined_name = paste(pitch_name, p_throws, "90", "pitcher", sep = "_")) %>%
+  ungroup() %>%
+  select(-p_throws, -swings, -pitch_name) %>%
+  pivot_wider(names_from = combined_name, values_from = pitch_90)
+
+############# Usage
+
+pitcher_usage <- data %>%
+  group_by(pitcher, p_throws, pitch_name) %>%
+  summarize(pitches = n()) %>%
+  group_by(pitcher) %>%
+  mutate(total_pitches = sum(pitches),
+         pitch_percentage = pitches / total_pitches,
+         combined_name = paste(pitch_name, p_throws, "usage", sep = "_")) %>%
+  select(-pitches, -total_pitches, -pitch_name) %>%
+  pivot_wider(names_from = combined_name, values_from = pitch_percentage) %>%
+  # change all NA to 0% usage
+  mutate(across(-p_throws, ~if_else(is.na(.), 0, .))) # ~ means "function"
+
+
+############# xBA last 75
+
+pitcher_xba_75 <- data %>%
+  group_by(pitcher) %>%
+  arrange(desc(game_pk), at_bat_number) %>%
+  mutate(pa_number = cumsum(events %in% plate_appearances_vector)) %>%
+  summarize(xba_75_pitcher = sum(estimated_ba_using_speedangle *
+                           (pa_number >= (max(pa_number) - 75)),
+                         na.rm = TRUE) /
+              sum(events %in% at_bats_vector *
+                           (pa_number >= (max(pa_number) - 75)),
+                          na.rm = TRUE))
+
+############## BF per game
+
+pitcher_bf_per_game <- data %>%
+  group_by(pitcher) %>%
+  summarize(bf_per_game_pitcher = sum(events %in% plate_appearances_vector, na.rm = T) /
+              length(unique(game_pk)))
+
+############## Join
+
+pitcher_stats <- pitcher_90 %>%
+  left_join(pitcher_usage, by = 'pitcher') %>%
+  left_join(pitcher_xba_75, by = 'pitcher') %>%
+  left_join(pitcher_bf_per_game, by = 'pitcher') %>%
+   select(pitcher, everything())
+
+
+print('Pitcher stats complete.')
+
+################################## Bullpen Stat #############################
+
+########### xba 150
+
+data_1 <- data %>%
+  left_join(starters, by='game_pk') %>%
+   mutate(is_starter = case_when(
+                                 pitcher == home_starter | pitcher == away_starter ~ 1,
+                                 TRUE ~ 0))
+
+data_1 <- data_1 %>%
+  filter(is_starter == 0)
+
+bullpen_stats <- data_1 %>%
+  group_by(pitcher_team) %>%
+  arrange(desc(game_pk), at_bat_number) %>%
+  mutate(pa_number = cumsum(events %in% plate_appearances_vector)) %>%
+  summarize(xba_150_bullpen = sum(estimated_ba_using_speedangle *
+                           (pa_number >= (max(pa_number) - 150)),
+                         na.rm = TRUE) /
+              sum(events %in% at_bats_vector *
+                           (pa_number >= (max(pa_number) - 150)),
+                          na.rm = TRUE))
+
+
+print('Bullpen stats complete.')
+
+################################## Gameday Information ########################
+game_pk <- mlb_game_pks(date, level_ids = c(1)) %>%
+  select(officialDate, game_pk) %>%
+  rename(date = officialDate)
+
+
+probs <- data.frame()
+
+for(pk in game_pk$game_pk){
+
+  new_row <- get_probables_mlb(as.character(pk)) %>%
+    mutate(date = game_date,
+           pitcher_name = fullName, 
+           pitcher = id,
+           pitcher_team = abbreviate(team)) %>%
+    select(date, game_pk, pitcher_name,
+           pitcher, pitcher_team)
+    
+  
+  probs <- rbind(probs, new_row) 
+  
+} # end probs
+
+
+lineups <- data.frame()
+
+for(pk in game_pk$game_pk){
+
+  new_row <- get_batting_orders(pk, type = "starting") %>%
+    mutate(date = date,
+           game_pk = pk,
+           batter = id,
+           batter_name = fullName,
+           batter_team = abbreviate(teamName)) %>%
+    select(date, game_pk, batter, batter_name, batter_team)
+    
+  
+  lineups <- rbind(lineups, new_row) 
+  
+} # end lineups 
+
+
+print('Gameday information complete.')
+
+################################## Join #######################################
+
+joined <- lineups %>%
+  left_join(probs, by = c('date', 'game_pk')) %>%
+  filter(batter_team != pitcher_team)
+
+today_data <- joined %>%
+  left_join(batter_stats, by = 'batter') %>%
+  left_join(pitcher_stats, by = 'pitcher') %>%
+  left_join(bullpen_stats, by = 'pitcher_team')
+
+today_data1 <- today_data %>%
+   mutate(throw_L = if_else(p_throws == 'L', 1, 0),
+           throw_R = if_else(p_throws == 'R', 1, 0)) %>%
+  filter(!is.infinite(xba_25)) 
+
+print('through1')
+
+write.csv(today_data1, "today_data.csv")
+today_data1 <- read.csv("today_data.csv")
+
+train_data <- read.csv("train_data.csv")
+
+missing_cols <- setdiff(colnames(train_data), colnames(today_data1))
+
+print('through2')
+print(head(today_data1))
+for(col in missing_cols){
+  today_data1[[col]] <- NA
+}
+
+print('through3')
+today_data1 <- today_data1 %>% 
+  select(colnames(train_data)) %>%
+  select(-hits_binary)
+
+
+ddata <- xgb.DMatrix(data = as.matrix(today_data1[,-c(1:9)]))
+
+print('through4')
+
+boost_preds <- predict(fit_1, ddata)
+
+pred_df <- data.frame(date = today_data$date, batter = today_data$batter_name, 
+                      batter_team = today_data$batter_team, pitcher = today_data$pitcher_name,
+                      pitcher_team = today_data$pitcher_team, pred_hit = boost_preds)
+
+
+print('function complete')
+
+return(pred_df)
+
+} # end function
+
+```
+
+
+
+
+```{r}
+predictions503 <- get_gameday_data(data = Statcast2024, date = "2024-05-03")
+```
+
+
+```{r}
+joined <- predictions430 %>%
+  left_join(dk_odds, by = c('batter' = 'batter_name')) %>%
+  filter(!is.na(o_u) & o_u == 0.5) %>%
+  mutate(dk_pred = prob_converter(dk_odds),
+         diff = pred_hit - dk_pred) %>%
+  rename(pred = pred_hit) %>%
+  select(date, batter, batter_team, pitcher, pitcher_team,
+         dk_odds, pred, dk_pred, diff)
+  
+```
+
+```{r}
+prob_converter <- function(x) {
+  prob <- ifelse(x > 0,
+                 # for positive odds
+                 100 / (x + 100),
+                 # for negative odds
+                 abs(x) / (abs(x) + 100))
+  
+  return(prob)
+}
+```
+
+```{r}
+save(get_gameday_data, odds_converter, prob_converter, file = "functions.rda")
+```
+
+
+

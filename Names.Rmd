@@ -1,0 +1,55 @@
+---
+title: "Names"
+author: "Ben Scartz"
+date: "2024-04-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(baseballr)
+```
+
+```{r}
+full_data <- read.csv('full_data.csv')
+
+
+database <- chadwick_player_lu() %>%
+  select(key_mlbam, name_last, name_first) %>%
+  filter(!is.na(key_mlbam)) %>%
+  mutate(player_name = paste(name_first, name_last, sep = " "))
+```
+
+```{r}
+batter_ids <- unique(full_data$batter)
+pitcher_ids <- unique(full_data$opp_starter)
+```
+
+```{r}
+batter_info <- data.frame(id = batter_ids) %>%
+  left_join(database, by = c("id" = "key_mlbam")) %>%
+  select(id, player_name)
+
+
+pitcher_info <- data.frame(id = pitcher_ids) %>%
+  left_join(database, by = c("id" = "key_mlbam")) %>%
+  select(id, player_name)
+
+
+write.csv(batter_info, 'batter_info.csv')
+write.csv(pitcher_info, 'pitcher_info.csv')
+```
+
+```{r}
+save(Statcast2024, file = 'Statcast2024.rda')
+```
+
+
+```{r}
+
+```
+

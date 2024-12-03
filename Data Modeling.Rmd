@@ -1,0 +1,207 @@
+---
+title: "Data Modeling"
+author: "Ben Scartz"
+date: "2024-04-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r warning=FALSE}
+library(tidyverse)
+library(xgboost)
+library(caret)
+```
+
+Odds converter function to convert probabilities to odds
+
+```{r}
+odds_converter <- function(x) {
+  odds <- ifelse(x >= 0.5, 
+                 # for negative odds
+                 -(x / (1 - x)) * 100, 
+                 # for positive odds
+                 ((1 - x) / x) * 100)
+  return(odds)
+}
+```
+
+
+```{r}
+full_data_2023 <- read.csv("full_data.csv") %>%
+  filter(pa_per_game >= 4)
+
+full_data_2022 <- read.csv("full_data_2022.csv") %>%
+  filter(pa_per_game >= 4)
+
+
+full_data <- bind_rows(full_data_2023, full_data_2022)
+
+```
+
+
+Remove columns that are  >= 95% NA (very rare pitch types, etc.)
+
+```{r}
+
+ n <- 0
+
+for(col in colnames(full_data)) {
+  
+  nas <- round(sum(is.na(full_data[,col])) / nrow(full_data),2) * 100
+  
+  if(nas >= 95){
+    full_data <- full_data %>% select(-col)
+    
+    print(paste("Removed column ", col, " because it was ", nas, "% NA!!!!", sep=''))
+  }
+  
+  if(nas >= 95){
+    n <- n + 1
+    
+  }
+  
+}
+
+print(paste("Went ahead and removed", n, "columns for ya no worries."))
+
+```
+
+
+```{r}
+full_data <- full_data %>%
+  filter(!is.infinite(xba_25)) %>%
+  mutate(hits_binary = if_else(hits > 0, 1, 0),
+         throw_L = if_else(p_throws == 'L', 1, 0),
+         throw_R = if_else(p_throws == 'R', 1, 0)) %>%
+  select(-hits,-p_throws)
+```
+
+# Model
+
+```{r}
+train_data <- full_data %>% filter(date < '2022-12-31')  
+test_data <- full_data %>% filter(date >= '2023-01-01') 
+```
+
+```{r}
+dtrain <- xgb.DMatrix(data = as.matrix(train_data[,-c(1:9,98)]), label = train_data$hits_binary)
+dtest <- xgb.DMatrix(data = as.matrix(test_data[,-c(1:9,98)]), label = test_data$hits_binary)
+```
+
+
+
+
+```{r}
+set.seed(42)
+fit_1 <- xgboost(dtrain,  # Set dataset to use
+                 nrounds = 100, 
+                 eta = 0.05, 
+      
+               verbose = 1, # 1 - Prints out fit
+                print_every_n = 100, # Prints out result every 20th iteration
+               
+               objective = "binary:logistic", 
+               eval_metric = "auc")
+                  
+```
+
+```{r}
+boost_preds <- predict(fit_1, dtest)
+
+pred_df <- data.frame(date = test_data$date, hit = test_data$hits_binary, pred_hit = boost_preds, batter = test_data$batter)
+```
+
+
+# Bet Selection Methods
+
+
+1. Bet the top 10 of the boost_preds for each date
+
+```{r}
+bet_per_day <- 10
+
+result_df <- pred_df %>%
+  group_by(date) %>%
+  # bet the top 10 of boost_preds for each date group
+  arrange(desc(pred_hit)) %>%
+  mutate(bet = if_else(row_number() <= bet_per_day, 1, 0))
+  
+
+conf_table <- table(result_df$bet, result_df$hit) # Create table
+cm <- confusionMatrix(conf_table, positive = "1")
+
+
+pos_rate <- cm$byClass[["Pos Pred Value"]] * 100
+
+print(paste("Bet hit percentage: ", round(pos_rate,1), "%", sep=''))
+
+odds_to_beat <- round(odds_converter(pos_rate/100),0)
+
+print(paste("You would beat average odds of ", odds_to_beat, sep=''))
+
+bets_placed <- sum(result_df$bet)
+total_days <- length(unique(test_data$date))
+
+print(paste("Placing ", bets_placed, " bets over ", total_days, " days.", sep=''))
+
+```
+
+2. Bet each pred over 0.80
+
+```{r}
+pred_needed <- 0.80
+
+result_df2 <- pred_df %>%
+         mutate(pred_class = if_else(pred_hit > pred_needed, 1, 0))
+         
+         
+
+conf_table2 <- table(result_df2$pred_class, result_df2$hit) # Create table
+cm2 <- confusionMatrix(conf_table2, positive = "1")
+
+
+pos_rate2 <- cm2$byClass[["Pos Pred Value"]] * 100
+
+print(paste("Bet hit percentage: ", round(pos_rate2,1), "%", sep=''))
+
+odds_to_beat2 <- round(odds_converter(pos_rate2/100),0)
+
+print(paste("You would beat average odds of ", odds_to_beat2, sep=''))
+
+bets_placed <- sum(result_df2$pred_class)
+total_days <- length(unique(test_data$date))
+
+print(paste("Placing ", bets_placed, " bets over ", total_days, " days (average of ", round(bets_placed / total_days, 1), " per day).", sep=''))
+
+```
+
+3. Parlay the three best preds each day
+
+```{r}
+parlay_size <- 3
+
+result_df3 <- pred_df %>%
+  group_by(date) %>%
+  # bet the top 10 of boost_preds for each date group
+  arrange(desc(pred_hit)) %>%
+  mutate(bet = if_else(row_number() <= parlay_size, 1, 0)) %>%
+  filter(bet == 1) %>%
+  group_by(date) %>%
+  summarize(parlay_hit = if_else(sum(hit) == parlay_size, 1, 0))
+  
+
+percentage <- sum(result_df3$parlay_hit) / nrow(result_df3) * 100
+
+print(paste("Parlay hit percentage: ", round(percentage,1), "%", sep=''))
+
+odds <- round(odds_converter(percentage/100),0)
+
+print(paste("You would beat average odds of +", odds, sep=''))
+
+```
+
+
+

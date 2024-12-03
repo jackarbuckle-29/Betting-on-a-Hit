@@ -1,0 +1,83 @@
+---
+title: "Untitled"
+author: "Ben Scartz"
+date: "2024-04-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(httr)
+library(jsonlite)
+```
+
+```{r}
+request1 <- GET("https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/?apiKey=90c891b5172ff2d1d8d2d0b91c46be1b&regions=us")
+
+game_table <- fromJSON(content(request1, as = "text"))
+
+game_ids <- game_table$id
+```
+
+
+
+
+
+```{r}
+
+request2 <- GET("https://api.the-odds-api.com/v4/sports/baseball_mlb/events/	
+0a6e2838fd534aabc1478643719e1e7b/odds?apiKey=90c891b5172ff2d1d8d2d0b91c46be1b&regions=us&markets=batter_hits&oddsFormat=american")
+
+request_list <- fromJSON(content(request2, as = "text"))
+
+dk_odds <- request_list$bookmakers$markets[[1]]$outcomes[[1]] %>%
+  filter(name == 'Over') %>%
+  rename(batter_name = description,
+         dk_odds = price,
+         o_u = point) %>%
+  select(-name)
+
+```
+
+```{r}
+
+game_table <- data.frame()
+
+request1 <- GET("https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/?apiKey=90c891b5172ff2d1d8d2d0b91c46be1b&regions=us")
+
+game_table <- fromJSON(content(request1, as = "text"))
+
+game_ids <- game_table$id
+
+
+dk_odds <- data.frame()
+
+
+for(id in game_ids){
+
+request2 <- GET(paste0("https://api.the-odds-api.com/v4/sports/baseball_mlb/events/",id,"/odds?apiKey=90c891b5172ff2d1d8d2d0b91c46be1b&regions=us&markets=batter_hits&oddsFormat=american"))
+
+
+request_list <- fromJSON(content(request2, as = "text"))
+
+if(!is.null(request_list$bookmakers$markets[[1]]$outcomes[[1]])){  
+
+new_row <- request_list$bookmakers$markets[[1]]$outcomes[[1]] %>%
+  filter(name == 'Over') %>%
+  rename(batter_name = description,
+         dk_odds = price,
+         o_u = point) %>%
+  select(-name)
+
+
+dk_odds <- rbind(dk_odds, new_row)
+}
+  
+}
+```
+
+
